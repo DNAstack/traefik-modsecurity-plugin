@@ -1,4 +1,4 @@
-module github.com/acouvreur/traefik-modsecurity-plugin
+module github.com/DNAstack/traefik-modsecurity-plugin
 
 go 1.17
 
