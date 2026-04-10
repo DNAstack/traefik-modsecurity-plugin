@@ -10,14 +10,23 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"time"
 )
 
+// BypassRule defines a request pattern that should skip the modsecurity check entirely.
+// Both Method and PathRegexp must match (when specified) for the bypass to apply.
+type BypassRule struct {
+	Method     string `json:"method,omitempty"`
+	PathRegexp string `json:"pathRegexp,omitempty"`
+}
+
 // Config the plugin configuration.
 type Config struct {
-	TimeoutMillis  int64  `json:"timeoutMillis"`
-	ModSecurityUrl string `json:"modSecurityUrl,omitempty"`
-	MaxBodySize    int64  `json:"maxBodySize"`
+	TimeoutMillis  int64        `json:"timeoutMillis"`
+	ModSecurityUrl string       `json:"modSecurityUrl,omitempty"`
+	MaxBodySize    int64        `json:"maxBodySize"`
+	BypassRules    []BypassRule `json:"bypassRules,omitempty"`
 }
 
 // CreateConfig creates the default plugin configuration.
@@ -31,6 +40,11 @@ func CreateConfig() *Config {
 	}
 }
 
+type compiledBypassRule struct {
+	method     string
+	pathRegexp *regexp.Regexp
+}
+
 // Modsecurity a Modsecurity plugin.
 type Modsecurity struct {
 	next           http.Handler
@@ -39,6 +53,7 @@ type Modsecurity struct {
 	name           string
 	httpClient     *http.Client
 	logger         *log.Logger
+	bypassRules    []compiledBypassRule
 }
 
 // New created a new Modsecurity plugin.
@@ -55,6 +70,18 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		timeout = time.Duration(config.TimeoutMillis) * time.Millisecond
 	}
 
+	var bypassRules []compiledBypassRule
+	for _, r := range config.BypassRules {
+		compiled, err := regexp.Compile(r.PathRegexp)
+		if err != nil {
+			return nil, fmt.Errorf("invalid bypass rule pathRegexp %q: %w", r.PathRegexp, err)
+		}
+		bypassRules = append(bypassRules, compiledBypassRule{
+			method:     r.Method,
+			pathRegexp: compiled,
+		})
+	}
+
 	return &Modsecurity{
 		modSecurityUrl: config.ModSecurityUrl,
 		maxBodySize:    config.MaxBodySize,
@@ -62,6 +89,7 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		name:           name,
 		httpClient:     &http.Client{Timeout: timeout},
 		logger:         log.New(os.Stdout, "", log.LstdFlags),
+		bypassRules:    bypassRules,
 	}, nil
 }
 
@@ -69,6 +97,13 @@ func (a *Modsecurity) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 	// Websocket not supported
 	if isWebsocket(req) {
+		a.next.ServeHTTP(rw, req)
+		return
+	}
+
+	// Bypass the modsecurity sidecar entirely for matching requests,
+	// eliminating the round-trip overhead for known-safe high-frequency paths.
+	if a.matchesBypassRule(req) {
 		a.next.ServeHTTP(rw, req)
 		return
 	}
@@ -144,4 +179,19 @@ func forwardResponse(resp *http.Response, rw http.ResponseWriter) {
 	rw.WriteHeader(resp.StatusCode)
 	// copy body
 	io.Copy(rw, resp.Body)
+}
+
+// matchesBypassRule returns true if the request matches any configured bypass rule.
+// Both Method and PathRegexp must match (when specified) for the rule to apply.
+func (a *Modsecurity) matchesBypassRule(req *http.Request) bool {
+	for _, rule := range a.bypassRules {
+		if rule.method != "" && rule.method != req.Method {
+			continue
+		}
+		if rule.pathRegexp != nil && req.URL != nil && !rule.pathRegexp.MatchString(req.URL.Path) {
+			continue
+		}
+		return true
+	}
+	return false
 }
